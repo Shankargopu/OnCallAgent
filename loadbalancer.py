@@ -1,4 +1,5 @@
 import os, asyncio
+from contextlib import asynccontextmanager, suppress
 from typing import List
 from urllib.parse import urlparse
 from fastapi import FastAPI, Request, Response
@@ -18,7 +19,37 @@ READ_TIMEOUT    = float(os.getenv("LB_READ_TIMEOUT", "5.0"))
 WRITE_TIMEOUT   = float(os.getenv("LB_WRITE_TIMEOUT", "5.0"))
 POOL_TIMEOUT    = float(os.getenv("LB_POOL_TIMEOUT", "3.0"))
 
-app = FastAPI(title="RR Load Balancer", version="0.2.0")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    app.state.client = httpx.AsyncClient(
+        timeout=httpx.Timeout(connect=CONNECT_TIMEOUT, read=READ_TIMEOUT, write=WRITE_TIMEOUT, pool=POOL_TIMEOUT),
+        follow_redirects=False,
+    )
+    app.state.backends = BACKENDS[:]
+
+    async def refresh():
+        while True:
+            print("it started running...")
+            try:
+                r = await app.state.client.get(f"{MANAGER_URL}/backends")
+                if r.status_code == 200:
+                    app.state.backends = r.json().get("backends", app.state.backends) or app.state.backends
+            except Exception:
+                pass
+            await asyncio.sleep(REFRESH_EVERY_SEC)
+
+    refresh_task = asyncio.create_task(refresh())
+    try:
+        print("it executes as well")
+        yield
+    finally:
+        print("it executes")
+        refresh_task.cancel()
+        with suppress(Exception):
+            await refresh_task
+        await app.state.client.aclose()
+
+app = FastAPI(title="RR Load Balancer", version="0.2.0", lifespan=lifespan)
 
 MANAGER_URL = os.getenv("PM_URL", "http://127.0.0.1:7070")
 REFRESH_EVERY_SEC = int(os.getenv("LB_REFRESH_SEC", "5"))
@@ -39,27 +70,7 @@ async def pick_primary_and_alt() -> tuple[str, str | None]:
         alt = backends[_rr_idx % n] if n > 1 else None
     return primary, alt
 
-@app.on_event("startup")
-async def _startup():
-    app.state.client = httpx.AsyncClient(
-        timeout=httpx.Timeout(connect=CONNECT_TIMEOUT, read=READ_TIMEOUT, write=WRITE_TIMEOUT, pool=POOL_TIMEOUT),
-        follow_redirects=False,
-    )
-    app.state.backends = BACKENDS[:]  # initial list
-    async def refresh():
-        while True:
-            try:
-                r = await app.state.client.get(f"{MANAGER_URL}/backends")
-                if r.status_code == 200:
-                    app.state.backends = r.json().get("backends", app.state.backends) or app.state.backends
-            except Exception:
-                pass
-            await asyncio.sleep(REFRESH_EVERY_SEC)
-    asyncio.create_task(refresh())
-
-@app.on_event("shutdown")
-async def _shutdown():
-    await app.state.client.aclose()
+ 
 
 @app.get("/healthz")
 async def healthz():
